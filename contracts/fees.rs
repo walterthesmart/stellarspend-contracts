@@ -1,7 +1,18 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env,
+    Env, Vec,
 };
+
+/// Represents a fee distribution recipient and their share.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct FeeRecipient {
+    /// Address of the recipient
+    pub address: Address,
+    /// Share in basis points (bps). Must be 0–10_000.
+    /// All recipients' shares must sum to 10_000 (100%).
+    pub share_bps: u32,
+}
 
 /// Storage keys used by the fees contract.
 #[derive(Clone)]
@@ -15,6 +26,14 @@ pub enum DataKey {
     TotalFeesCollected,
     /// Per-user fee accrual tracking. Stores total fees paid by each user.
     UserFeesAccrued(Address),
+    /// Fee distribution configuration. Stores vector of FeeRecipient.
+    FeeDistribution,
+    /// Cumulative fees distributed to a specific recipient.
+    RecipientFeesAccumulated(Address),
+    /// Minimum fee threshold. Fees cannot be less than this value.
+    MinFee,
+    /// Maximum fee threshold. Fees cannot exceed this value.
+    MaxFee,
 }
 
 #[contracterror]
@@ -31,6 +50,16 @@ pub enum FeeError {
     InvalidRefundAmount = 7,
     /// User has insufficient fee balance for the requested refund.
     InsufficientFeeBalance = 8,
+    /// Distribution configuration is invalid (empty, exceeds 100%, or contains invalid shares).
+    InvalidDistribution = 9,
+    /// Total distribution shares do not equal 100% (10_000 bps).
+    DistributionSumsToWrong = 10,
+    /// No fee distribution has been configured yet.
+    NoDistributionConfigured = 11,
+    /// Min fee is negative or max fee is negative.
+    InvalidFeeBound = 12,
+    /// Max fee is less than min fee.
+    InvalidFeeBoundRange = 13,
 }
 
 /// Events emitted by the fees contract.
@@ -58,6 +87,30 @@ impl FeeEvents {
         env.events().publish(
             topics,
             (user.clone(), refund_amount, reason, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn distribution_configured(env: &Env, admin: &Address, recipient_count: u32) {
+        let topics = (symbol_short!("fee"), symbol_short!("dist_cfg"));
+        env.events().publish(
+            topics,
+            (admin.clone(), recipient_count, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn fees_distributed(env: &Env, total_distributed: i128, recipient_count: u32) {
+        let topics = (symbol_short!("fee"), symbol_short!("distributed"));
+        env.events().publish(
+            topics,
+            (total_distributed, recipient_count, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn fee_bounds_configured(env: &Env, admin: &Address, min_fee: i128, max_fee: i128) {
+        let topics = (symbol_short!("fee"), symbol_short!("bounds_cfg"));
+        env.events().publish(
+            topics,
+            (admin.clone(), min_fee, max_fee, env.ledger().timestamp()),
         );
     }
 }
@@ -140,10 +193,17 @@ impl FeesContract {
 
     /// Calculates the fee for `amount` using the current percentage.
     ///
+    /// Applies min/max fee bounds if configured. The final fee will be:
+    /// - At least min_fee (if configured)
+    /// - At most max_fee (if configured)
+    /// - Otherwise, fee_percentage * amount / 10000
+    ///
     /// # Security
     /// - [SEC-FEES-04] Rejects non-positive amounts to prevent zero-fee bypass.
     /// - [SEC-FEES-05] All arithmetic uses `checked_*` to trap overflow/underflow
     ///   and panics with the typed `Overflow` error instead of silent wrap.
+    /// - [SEC-FEES-18] Min/max fee bounds are applied to prevent unbounded fees
+    ///   and ensure fees stay within configured ranges.
     pub fn calculate_fee(env: Env, amount: i128) -> i128 {
         // [SEC-FEES-04] Reject non-positive amounts.
         if amount <= 0 {
@@ -151,11 +211,31 @@ impl FeesContract {
         }
         let pct: u32 = Self::get_percentage(&env);
         // [SEC-FEES-05] Checked arithmetic throughout.
-        let fee = amount
+        let mut fee = amount
             .checked_mul(pct as i128)
             .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow))
             .checked_div(10_000)
             .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        // [SEC-FEES-18] Apply min/max fee bounds.
+        let min_fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinFee)
+            .unwrap_or(0);
+        let max_fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxFee)
+            .unwrap_or(i128::MAX);
+
+        if fee < min_fee {
+            fee = min_fee;
+        }
+        if fee > max_fee {
+            fee = max_fee;
+        }
+
         fee
     }
 
@@ -327,5 +407,221 @@ impl FeesContract {
 
         FeeEvents::fee_refunded(&env, &user, refund_amount, reason);
         refund_amount
+    }
+
+    /// Sets the fee distribution configuration.
+    ///
+    /// Defines which recipients receive distributed fees and their respective shares.
+    /// Only callable by the admin. Validates that:
+    /// - Distribution is not empty
+    /// - Each recipient has a valid share (0–10_000 bps)
+    /// - All shares sum exactly to 10_000 (100%)
+    ///
+    /// # Arguments
+    /// * `caller` - The address requesting configuration (must be admin)
+    /// * `recipients` - Vector of FeeRecipient with address and share_bps
+    ///
+    /// # Security
+    /// - [SEC-FEES-14] `caller.require_auth()` ensures only authorized admins can
+    ///   configure distributions.
+    /// - [SEC-FEES-15] Comprehensive validation prevents invalid distributions:
+    ///   empty lists, invalid shares, or sums != 100%.
+    pub fn set_distribution(env: Env, caller: Address, recipients: Vec<FeeRecipient>) {
+        // [SEC-FEES-14] Authenticate before any state mutation.
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        // [SEC-FEES-15] Validate distribution is not empty.
+        if recipients.len() == 0 {
+            panic_with_error!(&env, FeeError::InvalidDistribution);
+        }
+
+        let mut total_bps: u32 = 0;
+        for recipient in recipients.iter() {
+            // [SEC-FEES-15] Validate each share is within valid range.
+            if recipient.share_bps > 10_000 {
+                panic_with_error!(&env, FeeError::InvalidDistribution);
+            }
+            // [SEC-FEES-15] Accumulate total and check for overflow.
+            total_bps = total_bps
+                .checked_add(recipient.share_bps)
+                .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+        }
+
+        // [SEC-FEES-15] Ensure total equals exactly 100% (10_000 bps).
+        if total_bps != 10_000 {
+            panic_with_error!(&env, FeeError::DistributionSumsToWrong);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeDistribution, &recipients);
+        FeeEvents::distribution_configured(&env, &caller, recipients.len() as u32);
+    }
+
+    /// Returns the current fee distribution configuration.
+    ///
+    /// # Returns
+    /// Vector of FeeRecipient, or empty vector if no distribution configured
+    pub fn get_distribution(env: Env) -> Vec<FeeRecipient> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeDistribution)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Distributes accumulated fees to all configured recipients.
+    ///
+    /// Only callable by the admin. Requires that a valid distribution configuration
+    /// has been set. Distributes fees according to each recipient's share percentage.
+    ///
+    /// # Returns
+    /// Total amount distributed
+    ///
+    /// # Security
+    /// - [SEC-FEES-14] `caller.require_auth()` ensures only authorized admins can
+    ///   trigger distributions.
+    /// - [SEC-FEES-16] Distribution must be configured before distribution can occur.
+    /// - [SEC-FEES-17] All per-recipient distributions use checked arithmetic to
+    ///   prevent overflow.
+    pub fn distribute_fees(env: Env, caller: Address) -> i128 {
+        // [SEC-FEES-14] Authenticate before any state mutation.
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        // [SEC-FEES-16] Check distribution is configured.
+        let recipients: Vec<FeeRecipient> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeDistribution)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::NoDistributionConfigured));
+
+        if recipients.len() == 0 {
+            panic_with_error!(&env, FeeError::NoDistributionConfigured);
+        }
+
+        // Get current total fees to distribute
+        let total_to_distribute: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalFeesCollected)
+            .unwrap_or(0);
+
+        // If no fees to distribute, return early
+        if total_to_distribute <= 0 {
+            return 0;
+        }
+
+        let mut total_distributed: i128 = 0;
+
+        // Distribute to each recipient according to their share
+        for recipient in recipients.iter() {
+            // [SEC-FEES-17] Calculate recipient's share using checked arithmetic.
+            let recipient_share: i128 = total_to_distribute
+                .checked_mul(recipient.share_bps as i128)
+                .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow))
+                .checked_div(10_000)
+                .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+            // [SEC-FEES-17] Accumulate recipient's fees.
+            let mut recipient_fees: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::RecipientFeesAccumulated(recipient.address.clone()))
+                .unwrap_or(0);
+
+            recipient_fees = recipient_fees
+                .checked_add(recipient_share)
+                .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+            env.storage()
+                .instance()
+                .set(&DataKey::RecipientFeesAccumulated(recipient.address.clone()), &recipient_fees);
+
+            total_distributed = total_distributed
+                .checked_add(recipient_share)
+                .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+        }
+
+        // Reset total fees collected after distribution
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &0i128);
+
+        FeeEvents::fees_distributed(&env, total_distributed, recipients.len() as u32);
+        total_distributed
+    }
+
+    /// Returns the cumulative fees accumulated by a specific recipient.
+    ///
+    /// # Arguments
+    /// * `recipient` - The recipient address to query
+    ///
+    /// # Returns
+    /// Total fees accumulated for the recipient
+    pub fn get_recipient_fees_accumulated(env: Env, recipient: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RecipientFeesAccumulated(recipient))
+            .unwrap_or(0)
+    }
+
+    /// Sets the minimum and maximum fee bounds.
+    ///
+    /// Fees calculated from percentage will be bounded to stay within [min_fee, max_fee].
+    /// Only callable by the admin. Validates that:
+    /// - Both bounds are non-negative
+    /// - max_fee is >= min_fee
+    ///
+    /// # Arguments
+    /// * `caller` - The address requesting configuration (must be admin)
+    /// * `min_fee` - Minimum fee threshold (must be >= 0)
+    /// * `max_fee` - Maximum fee threshold (must be >= min_fee)
+    ///
+    /// # Security
+    /// - [SEC-FEES-19] `caller.require_auth()` ensures only authorized admins can
+    ///   configure fee bounds.
+    /// - [SEC-FEES-20] Comprehensive validation prevents invalid bounds:
+    ///   negative values or inverted ranges.
+    pub fn set_fee_bounds(env: Env, caller: Address, min_fee: i128, max_fee: i128) {
+        // [SEC-FEES-19] Authenticate before any state mutation.
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        // [SEC-FEES-20] Validate both bounds are non-negative.
+        if min_fee < 0 || max_fee < 0 {
+            panic_with_error!(&env, FeeError::InvalidFeeBound);
+        }
+
+        // [SEC-FEES-20] Validate max >= min.
+        if max_fee < min_fee {
+            panic_with_error!(&env, FeeError::InvalidFeeBoundRange);
+        }
+
+        env.storage().instance().set(&DataKey::MinFee, &min_fee);
+        env.storage().instance().set(&DataKey::MaxFee, &max_fee);
+        FeeEvents::fee_bounds_configured(&env, &caller, min_fee, max_fee);
+    }
+
+    /// Returns the minimum fee threshold.
+    ///
+    /// # Returns
+    /// Minimum fee in stroops, or 0 if not configured
+    pub fn get_min_fee(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinFee)
+            .unwrap_or(0)
+    }
+
+    /// Returns the maximum fee threshold.
+    ///
+    /// # Returns
+    /// Maximum fee in stroops, or i128::MAX if not configured
+    pub fn get_max_fee(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxFee)
+            .unwrap_or(i128::MAX)
     }
 }
